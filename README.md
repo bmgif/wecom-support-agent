@@ -13,3 +13,7 @@ powered by Hermes Agent.
 
 **Status:** Early development. The first milestone is receiving a test message
 from WeChat Customer Service and handing the conversation to a human agent.
+
+[Linux and Caddy guide for a fixed HTTPS callback and human handoff (Chinese)](docs/linux-caddy-milestone-1.md)
+
+[Windows local development guide (Chinese)](docs/windows-local-development.md)

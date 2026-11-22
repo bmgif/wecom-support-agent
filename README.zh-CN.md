@@ -12,3 +12,7 @@
 
 **项目状态**　开发初期。第一个里程碑是接收一条微信客服测试消息，
 并把会话转给人工坐席。
+
+[Linux 云服务器用 Caddy 配置固定 HTTPS，联调企微转人工](docs/linux-caddy-milestone-1.md)
+
+[Windows 本地开发指南](docs/windows-local-development.md)
