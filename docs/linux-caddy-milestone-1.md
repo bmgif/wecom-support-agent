@@ -1,14 +1,16 @@
 # Linux 上用固定 HTTPS 地址联调微信客服转人工
 
-在 Ubuntu 24.04 LTS 云服务器上运行 FastAPI 和 SQLite，由 Caddy 在固定子域名上接收企微 HTTPS 回调。验收时，普通微信用户发出「测试转人工」并收到坐席回复，且服务器上的 SQLite 记录为 `accepted`。
+在 **Ubuntu 24.04 LTS** 或 **Alibaba Cloud Linux 3.2104（OpenAnolis Edition）** 云服务器上运行 FastAPI 和 SQLite，由 Caddy 在固定子域名上接收企微 HTTPS 回调。每节标注了发行版专用命令，其余步骤通用。验收时，普通微信用户发出「测试转人工」并收到坐席回复，且服务器上的 SQLite 记录为 `accepted`。
 
-下文用 `kf-test.example.com` 和 `ubuntu@203.0.113.10` 举例。执行前换成企微可接受的实际子域名、云服务器 SSH 用户和公网 IP。需要服务器 `sudo` 权限、域名 DNS 管理权限、企微后台管理员、一名接待坐席和一个用于发送消息的普通微信账号。
+下文用 `kf-test.example.com` 和 `ubuntu@203.0.113.10` 举例。执行前换成企微可接受的实际子域名、云服务器 SSH 用户和公网 IP。若阿里云实例以 `root` 登录，可使用 `root@你的服务器公网IP`。Linux 下普通的 `sudo` 可以省略，切换运行用户的 `sudo -u` 命令照常执行。需要服务器管理权限、域名 DNS 管理权限、企微后台管理员、一名接待坐席和一个用于发送消息的普通微信账号。
 
 ## 1. 准备域名和云服务器
 
 1. 在 DNS 控制台添加测试子域名的 `A` 记录，指向服务器的固定公网 IPv4 地址。只有服务器也配置并开放了 IPv6 时才添加 `AAAA`。本指南由 Caddy 直接接收流量。如果 DNS 服务提供反向代理，为该测试记录选择仅 DNS 解析。
 2. 在云安全组或防火墙允许 TCP `80` 和 `443` 入站。SSH 使用现有管理规则，FastAPI 的 `8000` 端口只供本机使用。
 3. 在 Windows PowerShell 检查解析结果，确认 IP 正确。首次 SSH 登录时按云控制台提供的信息核对主机密钥指纹。
+
+阿里云 ECS 在实例关联的安全组中添加 TCP `80` 和 `443` 入方向规则。在中国内地地域开通公网 Web 服务前，先核对域名的 ICP 备案及阿里云接入状态。企微后台的域名验证仍按第 5 节操作。 [阿里云 ECS 安全组](https://help.aliyun.com/zh/ecs/user-guide/start-using-security-groups) · [备案与域名访问](https://help.aliyun.com/zh/dns/pubz-filing-domain-name-related-faq)
 
 ```powershell
 $WeComDomain = 'kf-test.example.com'
@@ -34,7 +36,13 @@ ssh.exe $WeComSsh
 
 ```bash
 cat /etc/os-release
+uname -m
 sudo ss -ltnp '( sport = :80 or sport = :443 or sport = :8000 )'
+```
+
+### Ubuntu 24.04 LTS 主机防火墙
+
+```bash
 sudo ufw status
 ```
 
@@ -45,13 +53,54 @@ sudo ufw allow 80/tcp
 sudo ufw allow 443/tcp
 ```
 
+### Alibaba Cloud Linux 3 主机防火墙
+
+检查 `firewalld` 的运行状态。若未运行，沿用实例已有的防火墙管理方式，并在 ECS 安全组核对放行规则。
+
+```bash
+systemctl is-active firewalld
+```
+
+若输出 `active`，先列出活跃 zone。把下方的 `public` 换成承载公网入站流量的网卡所属 zone，再分别添加运行时规则和永久规则。 [firewalld 命令参考](https://firewalld.org/documentation/man-pages/firewall-cmd.html)
+
+```bash
+sudo firewall-cmd --get-active-zones
+```
+
+```bash
+WECOM_FIREWALL_ZONE=public
+for wecom_service in http https; do
+    sudo firewall-cmd --zone="$WECOM_FIREWALL_ZONE" --add-service="$wecom_service"
+    sudo firewall-cmd --permanent --zone="$WECOM_FIREWALL_ZONE" --add-service="$wecom_service"
+done
+sudo firewall-cmd --zone="$WECOM_FIREWALL_ZONE" --list-services
+```
+
 ## 3. 安装并启动 FastAPI
+
+按发行版安装 Python，并在同一个 SSH 会话继续执行后面的命令。
+
+**Ubuntu 24.04 LTS**
+
+```bash
+sudo apt-get update
+sudo apt-get install -y python3-venv curl && WECOM_VENV_PYTHON=python3
+```
+
+**Alibaba Cloud Linux 3**
+
+使用阿里云官方 Yum 源的 Python 3.11。项目用它创建独立虚拟环境，系统命令继续使用发行版默认的 Python。 [阿里云 Python 3.11 安装指南](https://help.aliyun.com/zh/alinux/support/install-a-newer-python-3-on-alibaba-cloud-linux-3)
+
+```bash
+sudo yum install -y python3.11 curl tar ca-certificates && WECOM_VENV_PYTHON=python3.11
+python3.11 --version
+```
+
+**通用步骤**
 
 创建专用运行用户，将代码装到 `/srv/wecom-support-agent`，把 SQLite 目录交给运行用户。已有 `.env` 会保留。第一次部署时先用空配置启动健康检查。
 
 ```bash
-sudo apt-get update
-sudo apt-get install -y python3-venv curl
 if ! id -u wecom-support >/dev/null 2>&1; then
     sudo useradd --system --user-group --no-create-home \
         --home-dir /srv/wecom-support-agent --shell /usr/sbin/nologin wecom-support
@@ -64,7 +113,7 @@ sudo install -d -m 0750 -o wecom-support -g wecom-support data
 if ! sudo test -e .env; then
     sudo install -m 0640 -o root -g wecom-support .env.example .env
 fi
-sudo python3 -m venv .venv
+sudo "${WECOM_VENV_PYTHON:?请先执行当前发行版的 Python 安装步骤}" -m venv .venv
 sudo .venv/bin/python -m pip install -r requirements.txt
 ```
 
@@ -105,7 +154,11 @@ sudo journalctl -u wecom-support-agent -n 50 --no-pager
 
 ## 4. 安装 Caddy，启用公网 HTTPS
 
-新服务器使用 Caddy 的稳定版软件源。已经装好 Caddy 可以跳过安装，直接添加下面的站点配置。 [Caddy 在 Ubuntu 上的安装说明](https://caddyserver.com/docs/install#debian-ubuntu-raspbian)
+已经装好 Caddy 且由 `caddy.service` 管理时，可以跳过安装，直接配置测试域名。
+
+### Ubuntu 24.04 LTS 安装 Caddy
+
+新服务器使用 Caddy 的稳定版软件源。 [Caddy 在 Ubuntu 上的安装说明](https://caddyserver.com/docs/install#debian-ubuntu-raspbian)
 
 ```bash
 sudo apt-get install -y gnupg debian-keyring debian-archive-keyring apt-transport-https
@@ -119,6 +172,85 @@ sudo apt-get update
 sudo apt-get install -y caddy
 caddy version
 ```
+
+### Alibaba Cloud Linux 3 安装 Caddy
+
+在新装实例上使用 Caddy 官方 Linux 二进制。命令按服务器架构选包，并在安装前校验 SHA-256。以后升级时，从官方发布页核对版本和对应架构的校验值。 [Caddy 静态二进制安装](https://caddyserver.com/docs/install#static-binaries) · [Caddy v2.11.9 发布文件及 SHA-256](https://github.com/caddyserver/caddy/releases/expanded_assets/v2.11.9)
+
+若 ECS 下载失败，可以在 Windows 从官方发布页下载对应的 Linux 压缩包，再用 `scp.exe` 按原文件名上传到 SSH 用户的主目录。下面的安装命令会优先使用该文件，执行同样的校验。
+
+```bash
+(
+    set -eu
+    case "$(uname -m)" in
+        x86_64)
+            caddy_arch=amd64
+            caddy_sha256=5b8cb7faf8726a2028ad96a66e54e6e81e8f361bc6175e5d22bbd997cc5177fb
+            ;;
+        aarch64)
+            caddy_arch=arm64
+            caddy_sha256=5e377cff994fc9362a6fcf695c53f226cfca3a3ef85bd3a3687cf252d6310165
+            ;;
+        *)
+            echo '请从 Caddy 官方发布页面选择与服务器匹配的架构' >&2
+            exit 1
+            ;;
+    esac
+    caddy_version=2.11.9
+    caddy_tmp=$(mktemp -d)
+    archive="caddy_${caddy_version}_linux_${caddy_arch}.tar.gz"
+    cd "$caddy_tmp"
+    if [ -f "$HOME/$archive" ]; then
+        cp -- "$HOME/$archive" "$archive"
+    else
+        curl -fSL --retry 3 --connect-timeout 10 --max-time 180 -o "$archive" \
+            "https://github.com/caddyserver/caddy/releases/download/v${caddy_version}/${archive}"
+    fi
+    printf '%s  %s\n' "$caddy_sha256" "$archive" | sha256sum --check
+    tar -xzf "$archive" caddy
+    sudo install -m 0755 caddy /usr/bin/caddy
+    /usr/bin/caddy version
+)
+```
+
+首次安装时，创建专用的 Caddy 运行账号、证书存储目录和 systemd 服务。完成后继续配置域名。 [Caddy Linux 服务和 SELinux 配置](https://caddyserver.com/docs/running#linux-service)
+
+```bash
+if ! id -u caddy >/dev/null 2>&1; then
+    sudo useradd --system --user-group --no-create-home \
+        --home-dir /var/lib/caddy --shell /usr/sbin/nologin caddy
+fi
+sudo install -d -m 0755 /etc/caddy
+sudo install -d -m 0750 -o caddy -g caddy /var/lib/caddy
+sudo tee /etc/systemd/system/caddy.service >/dev/null <<'SYSTEMD'
+[Unit]
+Description=Caddy web server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+User=caddy
+Group=caddy
+Environment=HOME=/var/lib/caddy
+ExecStart=/usr/bin/caddy run --config /etc/caddy/Caddyfile --adapter caddyfile
+ExecReload=/usr/bin/caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile --force
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD
+if command -v restorecon >/dev/null 2>&1; then
+    sudo restorecon -v /usr/bin/caddy /etc/systemd/system/caddy.service
+fi
+sudo systemctl daemon-reload
+```
+
+### 配置测试域名并验证 HTTPS
 
 运行 `sudoedit /etc/caddy/Caddyfile`，在文件末尾添加以下站点块并换成真实域名。如果已有同名站点，在原站点内合并路径规则。Caddy 会保留回调请求的路径和查询参数。配置里不加访问日志，避免把回调查询参数写进访问日志。 [Caddy 反向代理](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy)
 
@@ -134,10 +266,16 @@ kf-test.example.com {
 }
 ```
 
-校验通过后再重载。域名指向服务器且端口开放时，Caddy 自动申请和续期公网证书。 [Caddy 自动 HTTPS](https://caddyserver.com/docs/automatic-https) · [Caddy 服务管理](https://caddyserver.com/docs/running#linux-service)
+以服务用户校验 Caddy 配置，确认它可以读取配置文件。校验成功后启动或重载服务。域名指向服务器且端口开放时，Caddy 自动申请和续期公网证书。 [Caddy 自动 HTTPS](https://caddyserver.com/docs/automatic-https) · [Caddy 服务管理](https://caddyserver.com/docs/running#linux-service)
 
 ```bash
-sudo caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile && sudo systemctl reload caddy
+if sudo -u caddy -H caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile; then
+    if systemctl is-active --quiet caddy; then
+        sudo systemctl reload caddy
+    else
+        sudo systemctl enable --now caddy
+    fi
+fi
 sudo journalctl -u caddy -n 50 --no-pager
 ```
 
@@ -258,6 +396,8 @@ sudo journalctl -u wecom-support-agent -f
 | 本机 `/healthz` 不通 | 看 `sudo journalctl -u wecom-support-agent -n 50 --no-pager`，检查依赖、`.env` 和 SQLite 目录权限。 |
 | 公网 HTTPS 无法访问或证书有误 | 检查域名的 `A` 记录和已有 `AAAA` 记录，确认云安全组及主机防火墙允许 `80`、`443`，看 `sudo journalctl -u caddy -n 50 --no-pager`。 |
 | 公网返回 `502` | 检查 Caddy 的上游地址和服务状态，在服务器上请求 `http://127.0.0.1:8000/healthz`。 |
+| Alibaba Cloud Linux 3 上的 Yum 找不到 Python 3.11 | 运行 `yum repolist --enabled` 和 `yum --showduplicates list python3.11`，检查阿里云官方源是否已启用。 |
+| Alibaba Cloud Linux 3 上 Caddy 日志出现 `Permission denied` | 检查 `caddy` 用户能否读取配置、证书目录是否归它所有。若 `getenforce` 显示 `Enforcing`，按 Caddy 官方指南检查程序和服务文件的 SELinux 标签。 |
 | 公网 `/healthz` 正常，但回调返回 `404` | 核对路径 `/webhooks/wecom/kf` 和 Caddy 的匹配规则。看应用是否已读取完整 `.env` 并重启。 |
 | 企微后台无法保存 URL | 查看后台给出的连接、域名或验签错误。若后台要求上传域名验证文件，按下方配置。验签失败时核对企业 ID、Token、EncodingAESKey 是否为同一配置。 |
 | 拉取报 `60020` 或账号不在列表 | 分别核对服务器公网出口 IP 和微信客服 Secret 的 API 管理范围。确认已换成真实 `open_kfid` 并重启。 |
