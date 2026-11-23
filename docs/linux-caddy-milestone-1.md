@@ -7,7 +7,7 @@
 ## 1. 准备域名和云服务器
 
 1. 在 DNS 控制台添加测试子域名的 `A` 记录，指向服务器的固定公网 IPv4 地址。只有服务器也配置并开放了 IPv6 时才添加 `AAAA`。本指南由 Caddy 直接接收流量。如果 DNS 服务提供反向代理，为该测试记录选择仅 DNS 解析。
-2. 在云安全组或防火墙允许 TCP `80` 和 `443` 入站。SSH 使用现有管理规则，FastAPI 的 `8000` 端口只供本机使用。
+2. 在云安全组或防火墙允许 TCP `80` 和 `443` 入站。SSH 使用现有管理规则。FastAPI 的后端端口默认是 `8000`，只供本机使用。
 3. 在 Windows PowerShell 检查解析结果，确认 IP 正确。首次 SSH 登录时按云控制台提供的信息核对主机密钥指纹。
 
 阿里云 ECS 在实例关联的安全组中添加 TCP `80` 和 `443` 入方向规则。在中国内地地域开通公网 Web 服务前，先核对域名的 ICP 备案及阿里云接入状态。企微后台的域名验证仍按第 5 节操作。 [阿里云 ECS 安全组](https://help.aliyun.com/zh/ecs/user-guide/start-using-security-groups) · [备案与域名访问](https://help.aliyun.com/zh/dns/pubz-filing-domain-name-related-faq)
@@ -37,8 +37,28 @@ ssh.exe $WeComSsh
 ```bash
 cat /etc/os-release
 uname -m
-sudo ss -ltnp '( sport = :80 or sport = :443 or sport = :8000 )'
+sudo ss -ltnp '( sport = :80 or sport = :443 )'
 ```
+
+### 检查 FastAPI 后端端口
+
+部署前检查服务器本机是否已有进程监听 `8000`。以下命令同时检查备用端口 `8001`，`-H` 隐藏表头。
+
+```bash
+sudo ss -H -ltnp '( sport = :8000 or sport = :8001 )'
+```
+
+- **没有 `:8000` 的记录**。按后续默认配置部署。
+- **`:8000` 已被其他服务占用，`:8001` 没有记录**。保留现有服务，让本项目用 `8001`。两个端口都有记录时，选另一个空闲的 TCP 端口，并用 `sudo ss -H -ltnp 'sport = :你的端口'` 检查。
+- **`:8000` 由已部署的本项目监听**。先检查 `curl -fsS http://127.0.0.1:8000/healthz`。服务正常时可以沿用该端口。
+
+如果选择 `8001`，同步调整以下三处。FastAPI 始终绑定 `127.0.0.1`，ECS 公网继续使用 Caddy 的 `80` 和 `443`，企微回调仍使用同一个 HTTPS URL。
+
+| 位置 | 使用 `8001` 时 |
+|---|---|
+| 第 3 节 systemd 的 `ExecStart` | 使用 `--host 127.0.0.1 --port 8001` |
+| 第 4 节 Caddyfile | 使用 `reverse_proxy 127.0.0.1:8001` |
+| 本机健康检查和第 7 节排查 | 使用 `curl -fsS http://127.0.0.1:8001/healthz` |
 
 ### Ubuntu 24.04 LTS 主机防火墙
 
@@ -78,13 +98,13 @@ sudo firewall-cmd --zone="$WECOM_FIREWALL_ZONE" --list-services
 
 ## 3. 安装并启动 FastAPI
 
-按发行版安装 Python，并在同一个 SSH 会话继续执行后面的命令。
+按发行版安装 Python。
 
 **Ubuntu 24.04 LTS**
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y python3-venv curl && WECOM_VENV_PYTHON=python3
+sudo apt-get install -y python3-venv curl
 ```
 
 **Alibaba Cloud Linux 3**
@@ -92,7 +112,7 @@ sudo apt-get install -y python3-venv curl && WECOM_VENV_PYTHON=python3
 使用阿里云官方 Yum 源的 Python 3.11。项目用它创建独立虚拟环境，系统命令继续使用发行版默认的 Python。 [阿里云 Python 3.11 安装指南](https://help.aliyun.com/zh/alinux/support/install-a-newer-python-3-on-alibaba-cloud-linux-3)
 
 ```bash
-sudo yum install -y python3.11 curl tar ca-certificates && WECOM_VENV_PYTHON=python3.11
+sudo yum install -y python3.11 curl tar ca-certificates
 python3.11 --version
 ```
 
@@ -113,11 +133,31 @@ sudo install -d -m 0750 -o wecom-support -g wecom-support data
 if ! sudo test -e .env; then
     sudo install -m 0640 -o root -g wecom-support .env.example .env
 fi
-sudo "${WECOM_VENV_PYTHON:?请先执行当前发行版的 Python 安装步骤}" -m venv .venv
-sudo .venv/bin/python -m pip install -r requirements.txt
 ```
 
-创建 systemd 服务。应用的一个进程同时处理回调和后台转接任务。保持单进程，避免多个进程同时消费这个 SQLite 队列。
+### 创建虚拟环境并安装依赖
+
+按发行版任选一组命令。已解包项目时，可以在新的 SSH 会话从这里继续。创建虚拟环境成功后才会安装依赖。
+
+**Ubuntu 24.04 LTS**
+
+```bash
+cd /srv/wecom-support-agent &&
+    sudo python3 -m venv .venv &&
+    sudo .venv/bin/python -m pip install -r requirements.txt
+```
+
+**Alibaba Cloud Linux 3**
+
+```bash
+cd /srv/wecom-support-agent &&
+    sudo python3.11 -m venv .venv &&
+    sudo .venv/bin/python -m pip install -r requirements.txt
+```
+
+### 启动 FastAPI 服务
+
+创建 systemd 服务。应用的一个进程同时处理回调和后台转接任务。保持单进程，避免多个进程同时消费这个 SQLite 队列。如果第 2 节选了其他端口，先修改下方 `ExecStart` 中的 `--port 8000`。如果服务文件已经写入，用 `sudoedit /etc/systemd/system/wecom-support-agent.service` 修改。
 
 ```bash
 sudo tee /etc/systemd/system/wecom-support-agent.service >/dev/null <<'SYSTEMD'
@@ -140,6 +180,11 @@ UMask=0077
 [Install]
 WantedBy=multi-user.target
 SYSTEMD
+```
+
+首次启动时执行以下命令。如果服务已经运行，且刚修改了服务文件，执行 `sudo systemctl daemon-reload && sudo systemctl restart wecom-support-agent` 使新端口生效。在服务器本机用实际端口请求 `/healthz`。
+
+```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now wecom-support-agent
 sudo systemctl status wecom-support-agent --no-pager
@@ -252,7 +297,7 @@ sudo systemctl daemon-reload
 
 ### 配置测试域名并验证 HTTPS
 
-运行 `sudoedit /etc/caddy/Caddyfile`，在文件末尾添加以下站点块并换成真实域名。如果已有同名站点，在原站点内合并路径规则。Caddy 会保留回调请求的路径和查询参数。配置里不加访问日志，避免把回调查询参数写进访问日志。 [Caddy 反向代理](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy)
+运行 `sudoedit /etc/caddy/Caddyfile`，在文件末尾添加以下站点块并换成真实域名。如果已有同名站点，在原站点内合并路径规则。把 `reverse_proxy` 的端口设为第 3 节本机健康检查通过的端口。Caddy 会保留回调请求的路径和查询参数。配置里不加访问日志，避免把回调查询参数写进访问日志。 [Caddy 反向代理](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy)
 
 ```caddyfile
 kf-test.example.com {
@@ -395,7 +440,8 @@ sudo journalctl -u wecom-support-agent -f
 |---|---|
 | 本机 `/healthz` 不通 | 看 `sudo journalctl -u wecom-support-agent -n 50 --no-pager`，检查依赖、`.env` 和 SQLite 目录权限。 |
 | 公网 HTTPS 无法访问或证书有误 | 检查域名的 `A` 记录和已有 `AAAA` 记录，确认云安全组及主机防火墙允许 `80`、`443`，看 `sudo journalctl -u caddy -n 50 --no-pager`。 |
-| 公网返回 `502` | 检查 Caddy 的上游地址和服务状态，在服务器上请求 `http://127.0.0.1:8000/healthz`。 |
+| Uvicorn 日志提示 `Address already in use` | 用第 2 节的 `ss` 命令确认占用进程，再按端口对照表选择空闲端口。 |
+| 公网返回 `502` | 检查 Caddy 的上游端口是否与 Uvicorn 一致，并在服务器上用实际端口请求本机 `/healthz`。 |
 | Alibaba Cloud Linux 3 上的 Yum 找不到 Python 3.11 | 运行 `yum repolist --enabled` 和 `yum --showduplicates list python3.11`，检查阿里云官方源是否已启用。 |
 | Alibaba Cloud Linux 3 上 Caddy 日志出现 `Permission denied` | 检查 `caddy` 用户能否读取配置、证书目录是否归它所有。若 `getenforce` 显示 `Enforcing`，按 Caddy 官方指南检查程序和服务文件的 SELinux 标签。 |
 | 公网 `/healthz` 正常，但回调返回 `404` | 核对路径 `/webhooks/wecom/kf` 和 Caddy 的匹配规则。看应用是否已读取完整 `.env` 并重启。 |
@@ -429,7 +475,7 @@ handle /WW_verify_EXAMPLE.txt {
 
 ### 更新代码
 
-再次按第 2 节打包和上传，然后在服务器解包并安装依赖。包内只包含代码、依赖清单和 `.env.example`。
+再次按第 2 节打包和上传，然后在服务器解包并安装依赖。包内只包含代码、依赖清单和 `.env.example`。如果部署时用了其他端口，将下面健康检查的 `8000` 替换为实际端口。
 
 ```bash
 sudo tar --extract --gzip --no-same-owner --no-same-permissions \
